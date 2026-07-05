@@ -3,15 +3,21 @@ package com.aufa.pyora
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,6 +45,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -48,11 +57,17 @@ import androidx.lifecycle.lifecycleScope
 import com.aufa.pyora.data.AppDatabase
 import com.aufa.pyora.data.DailySummary
 import com.aufa.pyora.data.DailySummaryDao
+import com.aufa.pyora.data.Memory
+import com.aufa.pyora.data.MemoryDao
 import com.aufa.pyora.data.MoneyTransaction
 import com.aufa.pyora.data.TransactionDao
 import com.aufa.pyora.ui.theme.PyoraTheme
 import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
 import java.time.LocalDate
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
@@ -60,6 +75,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var stepSensor: Sensor? = null
     private lateinit var summaryDao: DailySummaryDao
     private lateinit var txDao: TransactionDao
+    private lateinit var memoryDao: MemoryDao
 
     private var todaySteps by mutableIntStateOf(0)
     private var sensorAvailable by mutableStateOf(true)
@@ -76,6 +92,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val db = AppDatabase.getInstance(this)
         summaryDao = db.dailySummaryDao()
         txDao = db.transactionDao()
+        memoryDao = db.memoryDao()
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
@@ -87,6 +104,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     var tab by remember { mutableStateOf(0) }
                     val stepHistory by remember { summaryDao.getAll() }.collectAsState(initial = emptyList())
                     val txHistory by remember { txDao.getAll() }.collectAsState(initial = emptyList())
+                    val memoryHistory by remember { memoryDao.getAll() }.collectAsState(initial = emptyList())
 
                     Column(modifier = Modifier.fillMaxSize()) {
                         TabBar(selected = tab, onSelect = { tab = it })
@@ -96,10 +114,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                                 sensorAvailable = sensorAvailable,
                                 history = stepHistory
                             )
-                            else -> FinanceScreen(
+                            1 -> FinanceScreen(
                                 transactions = txHistory,
                                 onAdd = { amount, type, category, note ->
                                     addTransaction(amount, type, category, note)
+                                }
+                            )
+                            else -> MemoryScreen(
+                                memories = memoryHistory,
+                                onAdd = { note, photoPath ->
+                                    addMemory(note, photoPath)
                                 }
                             )
                         }
@@ -119,6 +143,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     type = type,
                     category = category,
                     timestamp = System.currentTimeMillis(),
+                    note = note
+                )
+            )
+        }
+    }
+
+    private fun addMemory(note: String?, photoPath: String?) {
+        lifecycleScope.launch {
+            memoryDao.insert(
+                Memory(
+                    timestamp = System.currentTimeMillis(),
+                    photoUri = photoPath,
                     note = note
                 )
             )
@@ -180,6 +216,33 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }
 
+// ================= HELPER =================
+
+private fun copyImageToInternal(context: Context, uri: Uri): String? {
+    return try {
+        val input = context.contentResolver.openInputStream(uri) ?: return null
+        val file = File(context.filesDir, "memory_${System.currentTimeMillis()}.jpg")
+        input.use { inp -> file.outputStream().use { out -> inp.copyTo(out) } }
+        file.absolutePath
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun loadBitmap(path: String): Bitmap? {
+    return try {
+        val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
+        BitmapFactory.decodeFile(path, opts)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun formatTime(millis: Long): String {
+    val sdf = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault())
+    return sdf.format(Date(millis))
+}
+
 // ================= TAB =================
 
 @Composable
@@ -187,11 +250,12 @@ fun TabBar(selected: Int, onSelect: (Int) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+            .padding(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         TabButton(label = "👟 Langkah", active = selected == 0) { onSelect(0) }
-        TabButton(label = "💰 Keuangan", active = selected == 1) { onSelect(1) }
+        TabButton(label = "💰 Uang", active = selected == 1) { onSelect(1) }
+        TabButton(label = "📸 Memori", active = selected == 2) { onSelect(2) }
     }
 }
 
@@ -412,5 +476,109 @@ fun TypeButton(label: String, active: Boolean, onClick: () -> Unit) {
         Button(onClick = onClick) { Text(label) }
     } else {
         OutlinedButton(onClick = onClick) { Text(label) }
+    }
+}
+
+// ================= MEMORI / KENANGAN =================
+
+@Composable
+fun MemoryScreen(
+    memories: List<Memory>,
+    onAdd: (String?, String?) -> Unit
+) {
+    val context = LocalContext.current
+    var note by remember { mutableStateOf("") }
+    var photoPath by remember { mutableStateOf<String?>(null) }
+
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            val path = copyImageToInternal(context, uri)
+            if (path != null) photoPath = path
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp)
+    ) {
+        Text(text = "📸 Kenangan", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+
+        OutlinedTextField(
+            value = note,
+            onValueChange = { note = it },
+            label = { Text("Tulis kenangan / catatan...") },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = {
+                picker.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                )
+            }) {
+                Text(if (photoPath == null) "📷 Pilih Foto" else "✅ Foto siap")
+            }
+            Button(
+                onClick = {
+                    if (note.isNotBlank() || photoPath != null) {
+                        onAdd(note.ifBlank { null }, photoPath)
+                        note = ""
+                        photoPath = null
+                    }
+                }
+            ) {
+                Text("Simpan Kenangan")
+            }
+        }
+
+        Spacer(Modifier.height(20.dp))
+        Text(text = "🗂️ Galeri Kenangan", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+
+        if (memories.isEmpty()) {
+            Text(text = "Belum ada kenangan tersimpan.", fontSize = 14.sp)
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxWidth()) {
+                items(memories) { memory ->
+                    MemoryCard(memory)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MemoryCard(memory: Memory) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+    ) {
+        Text(text = formatTime(memory.timestamp), fontSize = 12.sp)
+        if (!memory.note.isNullOrBlank()) {
+            Spacer(Modifier.height(4.dp))
+            Text(text = memory.note, fontSize = 16.sp)
+        }
+        memory.photoUri?.let { path ->
+            val bitmap = remember(path) { loadBitmap(path) }
+            if (bitmap != null) {
+                Spacer(Modifier.height(8.dp))
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider()
     }
 }
