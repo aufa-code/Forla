@@ -2,16 +2,16 @@ package com.aufa.pyora.data
 
 import androidx.room.Dao
 import androidx.room.Insert
-import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface PlaceDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert
     suspend fun insert(place: Place): Long
 
-    @Query("SELECT * FROM places")
+    @Query("SELECT * FROM places ORDER BY id DESC")
     fun getAll(): Flow<List<Place>>
 }
 
@@ -44,7 +44,7 @@ interface MemoryDao {
 
 @Dao
 interface DailySummaryDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Upsert
     suspend fun upsert(summary: DailySummary)
 
     @Query("SELECT * FROM daily_summary WHERE date = :date")
