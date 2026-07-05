@@ -64,7 +64,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Siapkan database + sensor
         dao = AppDatabase.getInstance(this).dailySummaryDao()
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
@@ -73,7 +72,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         setContent {
             PyoraTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    // Baca riwayat dari database (auto-update kalau ada data baru)
                     val history by remember { dao.getAll() }.collectAsState(initial = emptyList())
                     StepScreen(
                         steps = todaySteps,
@@ -118,9 +116,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_STEP_COUNTER) {
             val totalSinceBoot = event.values[0].toInt()
-            val today = LocalDate.now().toString() // contoh: 2026-07-04
+            val today = LocalDate.now().toString()
 
-            // Simpan "titik awal" langkah hari ini biar bisa hitung langkah HARI INI
             val prefs = getSharedPreferences("pyora", MODE_PRIVATE)
             val baselineKey = "baseline_$today"
             if (!prefs.contains(baselineKey)) {
@@ -149,13 +146,19 @@ fun StepScreen(
     sensorAvailable: Boolean,
     history: List<DailySummary>
 ) {
+    // ===== Fase 3: hitung insight dari data database =====
+    val last7 = history.take(7)
+    val weeklyTotal = last7.sumOf { it.totalSteps }
+    val avgPerDay = if (last7.isEmpty()) 0 else weeklyTotal / last7.size
+    val bestDay = history.maxByOrNull { it.totalSteps }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(24.dp))
         Text(text = "👟 Pyora", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
         Text(text = "Langkah hari ini", fontSize = 16.sp)
@@ -168,8 +171,37 @@ fun StepScreen(
             Text(text = "⚠️ HP ini nggak punya sensor step counter.", fontSize = 16.sp)
         }
 
-        Spacer(Modifier.height(32.dp))
-        Text(text = "📊 Riwayat (dari database)", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(28.dp))
+
+        // ===== Insight Mingguan =====
+        Text(
+            text = "📈 Insight Mingguan",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.align(Alignment.Start)
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            InsightItem(label = "Total 7 hari", value = "$weeklyTotal")
+            InsightItem(label = "Rata-rata/hari", value = "$avgPerDay")
+            InsightItem(
+                label = "Hari terbaik",
+                value = if (bestDay != null) "${bestDay.totalSteps}" else "-"
+            )
+        }
+
+        Spacer(Modifier.height(28.dp))
+
+        // ===== Riwayat =====
+        Text(
+            text = "📊 Riwayat",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.align(Alignment.Start)
+        )
         Spacer(Modifier.height(8.dp))
 
         if (history.isEmpty()) {
@@ -190,5 +222,13 @@ fun StepScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+fun InsightItem(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(text = value, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text(text = label, fontSize = 12.sp)
     }
 }
