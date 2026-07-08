@@ -105,6 +105,14 @@ import java.util.Date
 import java.util.Locale
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.width
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.SharedPreferences
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.RemoteInput
 
 
 // ================= WARNA & KONSTAN =================
@@ -115,6 +123,7 @@ private val TextGray = Color(0xFF9E9E9E)
 private val ExpenseRed = Color(0xFFFF6B6B)
 private const val DAILY_GOAL = 6000
 private const val DWELL_RADIUS_M = 40f
+private const val CHANNEL_ID = "pyora_expense"
 private const val DWELL_TIME_MS = 5L * 60L * 1000L // 5 menit
 
 class MainActivity : ComponentActivity(), SensorEventListener {
@@ -136,6 +145,23 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var isTracking by mutableStateOf(false)
     private var currentPlace by mutableStateOf("Belum terdeteksi")
     private var currentCoords by mutableStateOf("—")
+    private var currentPlaceId: Long? = null
+    private var confirmedVisitIds by mutableStateOf<Set<Long>>(emptySet())
+    private var activeVisitId: Long? = null
+    private var activeVisitPlaceId: Long? = null
+    private var activeVisitPlaceName: String? = null
+
+    private val notifPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key == "confirmed_visits") {
+            val stored = prefs.getStringSet("confirmed_visits", emptySet())?.toSet() ?: emptySet()
+            val ids = stored.mapNotNull { it.toLongOrNull() }.toSet()
+            runOnUiThread { confirmedVisitIds = ids }
+        }
+    }
 
     // ---- Deteksi kunjungan ----
     private var recognizedPlace by mutableStateOf<String?>(null)
@@ -197,6 +223,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lifecycleScope.launch {
             placeDao.getAll().collect { cachedPlaces = it }
         }
+        val storedConfirmed = getSharedPreferences("pyora", MODE_PRIVATE)
+            .getStringSet("confirmed_visits", emptySet()) ?: emptySet()
+        confirmedVisitIds = storedConfirmed.mapNotNull { it.toLongOrNull() }.toSet()
+
+        createNotifChannel()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = DarkBg, surface = DarkBg)) {
@@ -218,6 +253,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                             )
                             1 -> FinanceScreen(
                                 transactions = txHistory,
+                                currentPlaceName = recognizedPlace,
+                                places = places,
                                 onAdd = { amount, type, category, note ->
                                     addTransaction(amount, type, category, note)
                                 }
@@ -237,11 +274,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                                 onStart = { startTracking() },
                                 onStop = { stopTracking() },
                                 onMarkNow = { markHere() },
+                                onTestNotif = { testDepartureNotification() },
                                 onSavePlace = { name -> savePlace(name) }
                             )
                             else -> TimelineScreen(
                                 activities = activities,
-                                places = places
+                                places = places,
+                                transactions = txHistory,
+                                confirmedVisitIds = confirmedVisitIds,
+                                onConfirm = { visitId, placeId, amount ->
+                                    confirmVisitExpense(visitId, placeId, amount)
+                                }
                             )
                         }
                     }
@@ -317,6 +360,16 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         val dist = distanceMeters(aLat, aLng, lat, lng)
         if (dist > DWELL_RADIUS_M) {
+            val vid = activeVisitId
+            val vpid = activeVisitPlaceId
+            val vname = activeVisitPlaceName
+            if (vid != null && vname != null) {
+                notifyDeparture(vid, vpid, vname)
+            }
+            activeVisitId = null
+            activeVisitPlaceId = null
+            activeVisitPlaceName = null
+
             anchorLat = lat
             anchorLng = lng
             anchorTime = System.currentTimeMillis()
@@ -343,9 +396,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         if (match != null) {
             recognizedPlace = match.name
+            currentPlaceId = match.id
             visitInfo = "✅ Kamu sedang di ${match.name}"
         } else if (pendingLat == null) {
             recognizedPlace = null
+            currentPlaceId = null
         }
     }
 
@@ -355,10 +410,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
         if (match != null) {
             recognizedPlace = match.name
+            currentPlaceId = match.id
             pendingLat = null
             pendingLng = null
             visitInfo = "✅ Dikenali: ${match.name}"
-            recordVisit(match.id, anchorTime)
+            recordVisit(match.id, match.name, anchorTime)
         } else {
             recognizedPlace = null
             pendingLat = lat
@@ -382,10 +438,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val lat = pendingLat ?: lastLat ?: return
         val lng = pendingLng ?: lastLng ?: return
         lifecycleScope.launch {
-            val id = placeDao.insert(
-                Place(name = name, latitude = lat, longitude = lng, radiusMeters = 100.0)
-            )
-            activityDao.insert(
+            val id = placeDao.insert(Place(name = name, latitude = lat, longitude = lng, radiusMeters = 100.0))
+            val visitId = activityDao.insert(
                 ActivityRecord(
                     type = "visit",
                     startTime = if (anchorTime > 0L) anchorTime else System.currentTimeMillis(),
@@ -394,8 +448,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     stepCount = todaySteps
                 )
             )
+            activeVisitId = visitId
+            activeVisitPlaceId = id
+            activeVisitPlaceName = name
             withContext(Dispatchers.Main) {
                 recognizedPlace = name
+                currentPlaceId = id
                 pendingLat = null
                 pendingLng = null
                 visitInfo = "💾 Tersimpan: $name"
@@ -403,9 +461,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
-    private fun recordVisit(placeId: Long, startTime: Long) {
+    private fun recordVisit(placeId: Long, placeName: String, startTime: Long) {
         lifecycleScope.launch {
-            activityDao.insert(
+            val id = activityDao.insert(
                 ActivityRecord(
                     type = "visit",
                     startTime = startTime,
@@ -414,6 +472,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     stepCount = todaySteps
                 )
             )
+            activeVisitId = id
+            activeVisitPlaceId = placeId
+            activeVisitPlaceName = placeName
         }
     }
 
@@ -424,15 +485,41 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     // ================= TRANSAKSI & MEMORI =================
+
+    private fun confirmVisitExpense(visitId: Long, placeId: Long?, amount: Double?) {
+        val newSet = confirmedVisitIds + visitId
+        confirmedVisitIds = newSet
+        getSharedPreferences("pyora", MODE_PRIVATE).edit()
+            .putStringSet("confirmed_visits", newSet.map { it.toString() }.toSet())
+            .apply()
+        if (amount != null && amount > 0 && placeId != null) {
+            lifecycleScope.launch {
+                txDao.insert(
+                    MoneyTransaction(
+                        amount = amount,
+                        type = "expense",
+                        category = null,
+                        placeId = placeId,
+                        timestamp = System.currentTimeMillis(),
+                        note = "Konfirmasi kunjungan",
+                        source = "auto"
+                    )
+                )
+            }
+        }
+    }
     private fun addTransaction(amount: Double, type: String, category: String?, note: String?) {
+        val placeId = currentPlaceId
         lifecycleScope.launch {
             txDao.insert(
                 MoneyTransaction(
                     amount = amount,
                     type = type,
                     category = category,
+                    placeId = placeId,
                     timestamp = System.currentTimeMillis(),
-                    note = note
+                    note = note,
+                    source = if (placeId != null) "auto" else "manual"
                 )
             )
         }
@@ -469,16 +556,120 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    private fun createNotifChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Konfirmasi Pengeluaran",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply { description = "Notifikasi saat kamu meninggalkan suatu tempat" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+    }
+
+    private fun expensePendingIntent(
+        visitId: Long, placeId: Long?, amount: Double, requestCode: Int, mutable: Boolean
+    ): PendingIntent {
+        val intent = Intent(this, ExpenseReceiver::class.java).apply {
+            action = ExpenseReceiver.ACTION_LOG
+            putExtra(ExpenseReceiver.EXTRA_VISIT_ID, visitId)
+            putExtra(ExpenseReceiver.EXTRA_PLACE_ID, placeId ?: -1L)
+            putExtra(ExpenseReceiver.EXTRA_AMOUNT, amount)
+            putExtra(ExpenseReceiver.EXTRA_NOTIF_ID, visitId.toInt())
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            PendingIntent.FLAG_UPDATE_CURRENT or
+                    (if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE)
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        return PendingIntent.getBroadcast(this, requestCode, intent, flags)
+    }
+
+    private fun notifyDeparture(visitId: Long, placeId: Long?, placeName: String) {
+        createNotifChannel()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        val notifId = visitId.toInt()
+        val base = notifId * 10
+
+        val remoteInput = RemoteInput.Builder(ExpenseReceiver.KEY_REPLY)
+            .setLabel("Nominal (Rp)")
+            .build()
+        val replyAction = NotificationCompat.Action.Builder(
+            0, "Isi nominal", expensePendingIntent(visitId, placeId, -1.0, base + 0, mutable = true)
+        ).addRemoteInput(remoteInput).setAllowGeneratedReplies(false).build()
+
+        val a5 = NotificationCompat.Action.Builder(
+            0, "Rp5rb", expensePendingIntent(visitId, placeId, 5000.0, base + 1, false)
+        ).build()
+        val a10 = NotificationCompat.Action.Builder(
+            0, "Rp10rb", expensePendingIntent(visitId, placeId, 10000.0, base + 2, false)
+        ).build()
+        val aNone = NotificationCompat.Action.Builder(
+            0, "Gak ada", expensePendingIntent(visitId, placeId, 0.0, base + 3, false)
+        ).build()
+
+        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentTitle("Habis berapa di $placeName?")
+            .setContentText("Catat pengeluaranmu tadi langsung dari sini.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .addAction(replyAction)
+            .addAction(a5)
+            .addAction(a10)
+            .addAction(aNone)
+            .build()
+
+        try {
+            NotificationManagerCompat.from(this).notify(notifId, notif)
+        } catch (e: SecurityException) {
+            // abaikan kalau izin notif belum ada
+        }
+    }
+
+    private fun testDepartureNotification() {
+        val pid = currentPlaceId
+        val pname = recognizedPlace
+        if (pid == null || pname == null) {
+            visitInfo = "Harus di tempat tersimpan dulu (mis. rumah)"
+            return
+        }
+        lifecycleScope.launch {
+            val id = activityDao.insert(
+                ActivityRecord(
+                    type = "visit",
+                    startTime = System.currentTimeMillis() - DWELL_TIME_MS,
+                    endTime = System.currentTimeMillis(),
+                    placeId = pid,
+                    stepCount = todaySteps
+                )
+            )
+            notifyDeparture(id, pid, pname)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         startStepSensor()
         if (wantTracking) beginLocationUpdates()
+        getSharedPreferences("pyora", MODE_PRIVATE)
+            .registerOnSharedPreferenceChangeListener(prefsListener)
+        val stored = getSharedPreferences("pyora", MODE_PRIVATE)
+            .getStringSet("confirmed_visits", emptySet()) ?: emptySet()
+        confirmedVisitIds = stored.mapNotNull { it.toLongOrNull() }.toSet()
     }
 
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(this)
         fusedClient.removeLocationUpdates(locationCallback)
+        getSharedPreferences("pyora", MODE_PRIVATE)
+            .unregisterOnSharedPreferenceChangeListener(prefsListener)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -774,6 +965,8 @@ fun StepRing(steps: Int, goal: Int) {
 @Composable
 fun FinanceScreen(
     transactions: List<MoneyTransaction>,
+    currentPlaceName: String?,
+    places: List<Place>,
     onAdd: (Double, String, String?, String?) -> Unit
 ) {
     var amountText by remember { mutableStateOf("") }
@@ -781,6 +974,7 @@ fun FinanceScreen(
     var note by remember { mutableStateOf("") }
     var type by remember { mutableStateOf("expense") }
 
+    val placeMap = remember(places) { places.associateBy { it.id } }
     val totalIncome = transactions.filter { it.type == "income" }.sumOf { it.amount }
     val totalExpense = transactions.filter { it.type == "expense" }.sumOf { it.amount }
     val balance = totalIncome - totalExpense
@@ -836,6 +1030,15 @@ fun FinanceScreen(
         }
         Spacer(Modifier.height(12.dp))
 
+        if (currentPlaceName != null) {
+            Text(
+                text = "📍 Otomatis ditandai di: $currentPlaceName",
+                color = Neon,
+                fontSize = 12.sp
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+
         NeonButton(text = "Tambah Transaksi", modifier = Modifier.fillMaxWidth()) {
             val amount = amountText.toDoubleOrNull()
             if (amount != null && amount > 0) {
@@ -864,6 +1067,13 @@ fun FinanceScreen(
                                 Text(text = tx.category ?: "Lainnya", color = Color.White, fontSize = 15.sp)
                                 if (!tx.note.isNullOrBlank()) {
                                     Text(text = tx.note, color = TextGray, fontSize = 12.sp)
+                                }
+                                tx.placeId?.let { pid ->
+                                    Text(
+                                        text = "📍 ${placeMap[pid]?.name ?: "Tempat"}",
+                                        color = Neon,
+                                        fontSize = 11.sp
+                                    )
                                 }
                             }
                             Text(
@@ -1010,6 +1220,7 @@ fun LocationScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onMarkNow: () -> Unit,
+    onTestNotif: () -> Unit,
     onSavePlace: (String) -> Unit
 ) {
     Column(
@@ -1112,6 +1323,13 @@ fun LocationScreen(
                 border = BorderStroke(1.dp, Neon),
                 modifier = Modifier.fillMaxWidth()
             ) { Text("🔖  Tandai Tempat Ini Sekarang") }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onTestNotif,
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Neon),
+                border = BorderStroke(1.dp, Neon),
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("🔔  Tes Notifikasi Pergi") }
         }
 
         Spacer(Modifier.height(20.dp))
@@ -1145,27 +1363,55 @@ fun LocationScreen(
 @Composable
 fun TimelineScreen(
     activities: List<ActivityRecord>,
-    places: List<Place>
+    places: List<Place>,
+    transactions: List<MoneyTransaction>,
+    confirmedVisitIds: Set<Long>,
+    onConfirm: (Long, Long?, Double?) -> Unit
 ) {
     val today = LocalDate.now()
     val placeMap = remember(places) { places.associateBy { it.id } }
     val todayVisits = activities
         .filter { it.type == "visit" && millisToLocalDate(it.startTime) == today }
         .sortedBy { it.startTime }
+    val todayExpenses = transactions
+        .filter { it.type == "expense" && millisToLocalDate(it.timestamp) == today }
+
+    val pending = todayVisits.filter { it.id !in confirmedVisitIds }.reversed()
 
     val totalPlaces = todayVisits.mapNotNull { it.placeId }.distinct().size
     val totalDurationMs = todayVisits.sumOf { (it.endTime - it.startTime).coerceAtLeast(0L) }
+
+    val placeIdsToday = todayVisits.mapNotNull { it.placeId }.distinct()
+    val perPlace = placeIdsToday.map { pid ->
+        val name = placeMap[pid]?.name ?: "Tempat tak dikenal"
+        val dur = todayVisits.filter { it.placeId == pid }.sumOf { (it.endTime - it.startTime).coerceAtLeast(0L) }
+        val exp = todayExpenses.filter { it.placeId == pid }.sumOf { it.amount }
+        Triple(name, dur, exp)
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
+            .verticalScroll(rememberScrollState())
             .padding(24.dp)
     ) {
         Text(text = "🗓️ Linimasa Hari Ini", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.White)
         Spacer(Modifier.height(6.dp))
         Text(text = formatDateHeader(today), fontSize = 13.sp, color = TextGray)
         Spacer(Modifier.height(18.dp))
+
+        if (pending.isNotEmpty()) {
+            SectionTitle("⏳ Perlu Dikonfirmasi (${pending.size})")
+            pending.forEach { visit ->
+                PendingExpenseCard(
+                    placeName = placeMap[visit.placeId]?.name ?: "Tempat tak dikenal",
+                    visit = visit,
+                    onConfirm = onConfirm
+                )
+            }
+            Spacer(Modifier.height(22.dp))
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1177,8 +1423,35 @@ fun TimelineScreen(
         }
 
         Spacer(Modifier.height(22.dp))
-        SectionTitle("📍 Perjalananmu")
+        SectionTitle("💰 Rekap per Tempat")
+        if (perPlace.isEmpty()) {
+            Text(text = "Belum ada data.", fontSize = 14.sp, color = TextGray)
+        } else {
+            perPlace.forEach { (name, dur, exp) ->
+                PyoraCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(text = name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(2.dp))
+                            Text(text = "⏱️ ${formatDuration(dur)}", color = TextGray, fontSize = 12.sp)
+                        }
+                        Text(
+                            text = if (exp > 0) "- ${formatRupiah(exp)}" else "Rp0",
+                            color = if (exp > 0) ExpenseRed else TextGray,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+            }
+        }
 
+        Spacer(Modifier.height(22.dp))
+        SectionTitle("📍 Perjalananmu")
         if (todayVisits.isEmpty()) {
             Text(
                 text = "Belum ada kunjungan tercatat hari ini.\n\nDiam ≥5 menit di suatu tempat, atau buka tab 📍 lalu tap \"Tandai Tempat Ini Sekarang\" buat nyoba.",
@@ -1186,16 +1459,84 @@ fun TimelineScreen(
                 color = TextGray
             )
         } else {
-            LazyColumn(modifier = Modifier.fillMaxWidth()) {
-                items(todayVisits) { visit ->
-                    TimelineItem(
-                        visit = visit,
-                        placeName = placeMap[visit.placeId]?.name ?: "Tempat tak dikenal"
-                    )
-                }
+            todayVisits.forEach { visit ->
+                TimelineItem(
+                    visit = visit,
+                    placeName = placeMap[visit.placeId]?.name ?: "Tempat tak dikenal"
+                )
             }
         }
     }
+}
+
+@Composable
+fun PendingExpenseCard(
+    placeName: String,
+    visit: ActivityRecord,
+    onConfirm: (Long, Long?, Double?) -> Unit
+) {
+    var custom by remember { mutableStateOf("") }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(CardBg)
+            .padding(16.dp)
+    ) {
+        Text(text = "Habis berapa di $placeName?", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = "🕐 ${formatHourMinute(visit.startTime)} – ${formatHourMinute(visit.endTime)}",
+            color = TextGray,
+            fontSize = 12.sp
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ChipButton("Rp5rb", Modifier.weight(1f)) { onConfirm(visit.id, visit.placeId, 5000.0) }
+            ChipButton("Rp10rb", Modifier.weight(1f)) { onConfirm(visit.id, visit.placeId, 10000.0) }
+            ChipButton("Rp20rb", Modifier.weight(1f)) { onConfirm(visit.id, visit.placeId, 20000.0) }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedTextField(
+                value = custom,
+                onValueChange = { input -> custom = input.filter { it.isDigit() } },
+                label = { Text("Nominal lain") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                colors = pyoraFieldColors(),
+                modifier = Modifier.weight(1f)
+            )
+            NeonButton(text = "OK") {
+                val amt = custom.toDoubleOrNull()
+                if (amt != null && amt > 0) {
+                    onConfirm(visit.id, visit.placeId, amt)
+                    custom = ""
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { onConfirm(visit.id, visit.placeId, null) },
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextGray),
+            border = BorderStroke(1.dp, TextGray),
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Gak ada pengeluaran") }
+    }
+}
+
+@Composable
+fun RowScope.ChipButton(label: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = Neon),
+        border = BorderStroke(1.dp, Neon),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
+        modifier = modifier
+    ) { Text(label, fontSize = 13.sp) }
 }
 
 @Composable
