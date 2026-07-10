@@ -94,6 +94,18 @@ import java.time.ZoneId
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.composed
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.compose.foundation.Image
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import android.widget.Toast
 
 // ================= KONSTAN =================
 private const val STEP_GOAL = 8000
@@ -473,13 +485,16 @@ fun MacroBar(label: String, current: Double, target: Double, color: Color) {
     }
 }
 
-// ================= 1. CATAT MAKAN (manual) =================
+// ================= 1. CATAT MAKAN (foto + AI) =================
 @Composable
 fun AddFoodScreen(
     todayFoods: List<FoodEntry>,
     onAdd: (FoodEntry) -> Unit,
     onDelete: (FoodEntry) -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
     var name by remember { mutableStateOf("") }
     var takaran by remember { mutableStateOf("") }
     var isDrink by remember { mutableStateOf(false) }
@@ -490,18 +505,99 @@ fun AddFoodScreen(
     var carb by remember { mutableStateOf("") }
     var meal by remember { mutableStateOf("breakfast") }
 
+    var photo by remember { mutableStateOf<Bitmap?>(null) }
+    var analyzing by remember { mutableStateOf(false) }
+    var aiMsg by remember { mutableStateOf<String?>(null) }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.TakePicturePreview()
+    ) { bmp -> if (bmp != null) { photo = bmp; aiMsg = null } }
+
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia()
+    ) { uri -> if (uri != null) { photo = uriToBitmap(context, uri); aiMsg = null } }
+
+    fun runAi() {
+        val bmp = photo ?: return
+        analyzing = true; aiMsg = null
+        scope.launch {
+            try {
+                val res = GeminiHelper.analyzeFood(BuildConfig.GEMINI_API_KEY, bmp, takaran)
+                if (name.isBlank()) name = res.name
+                cal = res.calories.toInt().toString()
+                pro = res.protein.toInt().toString()
+                fat = res.fat.toInt().toString()
+                carb = res.carbs.toInt().toString()
+                aiMsg = "✅ Terisi dari AI — cek & koreksi kalau perlu."
+            } catch (e: Exception) {
+                aiMsg = "⚠️ Gagal analisis: ${e.message}"
+            } finally {
+                analyzing = false
+            }
+        }
+    }
+
     Column(
         modifier = Modifier.fillMaxSize().background(ForlaBg)
             .verticalScroll(rememberScrollState()).padding(20.dp)
     ) {
         Text("📷 Catat Makanan", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = ForlaText)
-        Text("Input manual dulu — foto + AI menyusul.", fontSize = 12.sp, color = ForlaTextSub)
+        Text("Foto + takaran → AI isi otomatis.", fontSize = 12.sp, color = ForlaTextSub)
         Spacer(Modifier.height(16.dp))
 
-        OutlinedTextField(name, { name = it }, label = { Text("Nama makanan") },
+        // ---- Foto ----
+        if (photo != null) {
+            Image(
+                bitmap = photo!!.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(200.dp).clip(RoundedCornerShape(16.dp))
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { cameraLauncher.launch(null) },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = ForlaPrimary),
+                border = BorderStroke(1.dp, ForlaPrimary),
+                modifier = Modifier.weight(1f)
+            ) { Text("📷 Kamera") }
+            OutlinedButton(
+                onClick = {
+                    galleryLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = ForlaPrimary),
+                border = BorderStroke(1.dp, ForlaPrimary),
+                modifier = Modifier.weight(1f)
+            ) { Text("🖼️ Galeri") }
+        }
+
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(takaran, { takaran = it },
+            label = { Text("Takaran (mis. 3 centong nasi, 2 dada ayam)") },
             colors = forlaFieldColors(), modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
-        OutlinedTextField(takaran, { takaran = it }, label = { Text("Takaran (mis. 3 centong nasi)") },
+
+        if (photo != null) {
+            if (analyzing) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(color = ForlaPrimary, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Menganalisis makanan...", color = ForlaTextSub, fontSize = 13.sp)
+                }
+            } else {
+                ForlaButton("🤖 Analisis dengan AI", modifier = Modifier.fillMaxWidth()) { runAi() }
+            }
+        }
+        aiMsg?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, color = if (it.startsWith("✅")) ForlaSurplus else ForlaDeficit, fontSize = 12.sp)
+        }
+
+        Spacer(Modifier.height(14.dp))
+        OutlinedTextField(name, { name = it }, label = { Text("Nama makanan") },
             colors = forlaFieldColors(), modifier = Modifier.fillMaxWidth())
 
         Spacer(Modifier.height(10.dp))
@@ -566,6 +662,7 @@ fun AddFoodScreen(
                     )
                 )
                 name = ""; takaran = ""; volume = ""; cal = ""; pro = ""; fat = ""; carb = ""
+                photo = null; aiMsg = null
             }
         }
 
@@ -576,8 +673,7 @@ fun AddFoodScreen(
         } else {
             todayFoods.forEach { food ->
                 ForlaCard {
-                    Row(modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(food.name, color = ForlaText, fontSize = 15.sp, fontWeight = FontWeight.Bold)
                             if (!food.takaranText.isNullOrBlank())
@@ -599,6 +695,11 @@ fun AddFoodScreen(
         Spacer(Modifier.height(24.dp))
     }
 }
+
+// helper: Uri galeri -> Bitmap
+fun uriToBitmap(context: Context, uri: Uri): Bitmap? = try {
+    context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+} catch (e: Exception) { null }
 
 // ================= 2. AKTIVITAS =================
 @Composable
@@ -711,6 +812,7 @@ fun ProfileScreen(profile: UserProfile?, onSave: (UserProfile) -> Unit) {
     var tPro by remember { mutableStateOf("") }
     var tFat by remember { mutableStateOf("") }
     var tCarb by remember { mutableStateOf("") }
+    val context = LocalContext.current
 
     LaunchedEffect(profile) {
         profile?.let {
@@ -772,7 +874,6 @@ fun ProfileScreen(profile: UserProfile?, onSave: (UserProfile) -> Unit) {
             ChoiceChip("Aktif", activity == "active") { activity = "active" }
             ChoiceChip("Sangat", activity == "veryActive") { activity = "veryActive" }
         }
-
         if (tdee > 0) {
             Spacer(Modifier.height(14.dp))
             ForlaCard {
@@ -804,13 +905,28 @@ fun ProfileScreen(profile: UserProfile?, onSave: (UserProfile) -> Unit) {
 
         Spacer(Modifier.height(16.dp))
         ForlaButton("Simpan Profil", modifier = Modifier.fillMaxWidth()) {
+            val autoCal = if (tdee > 0) tdee + 400 else 2500
+            val autoPro = if (wKg > 0) (wKg * 2).toInt() else 150
+            val autoFat = ((autoCal * 0.25) / 9).toInt()
+            val autoCarb = ((autoCal - autoPro * 4 - autoFat * 9) / 4).coerceAtLeast(0)
+
+            val finalCal = tCal.toDoubleOrNull() ?: autoCal.toDouble()
+            val finalPro = tPro.toDoubleOrNull() ?: autoPro.toDouble()
+            val finalFat = tFat.toDoubleOrNull() ?: autoFat.toDouble()
+            val finalCarb = tCarb.toDoubleOrNull() ?: autoCarb.toDouble()
+
+            tCal = finalCal.toInt().toString()
+            tPro = finalPro.toInt().toString()
+            tFat = finalFat.toInt().toString()
+            tCarb = finalCarb.toInt().toString()
+
             onSave(
                 UserProfile(
                     id = 1,
-                    targetCalories = tCal.toDoubleOrNull() ?: 0.0,
-                    targetProtein = tPro.toDoubleOrNull() ?: 0.0,
-                    targetFat = tFat.toDoubleOrNull() ?: 0.0,
-                    targetCarbs = tCarb.toDoubleOrNull() ?: 0.0,
+                    targetCalories = finalCal,
+                    targetProtein = finalPro,
+                    targetFat = finalFat,
+                    targetCarbs = finalCarb,
                     weightKg = wKg,
                     heightCm = hCm,
                     age = ageI,
@@ -818,6 +934,7 @@ fun ProfileScreen(profile: UserProfile?, onSave: (UserProfile) -> Unit) {
                     activityLevel = activity
                 )
             )
+            Toast.makeText(context, "✅ Profil & target tersimpan!", Toast.LENGTH_SHORT).show()
         }
         Spacer(Modifier.height(24.dp))
     }
