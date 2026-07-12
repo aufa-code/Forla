@@ -106,6 +106,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import android.widget.Toast
+import android.content.Intent
 
 // ================= KONSTAN =================
 private const val STEP_GOAL = 8000
@@ -113,22 +114,18 @@ private const val STEP_KCAL = 0.04          // ~0.04 kkal per langkah
 private const val DEFAULT_BMR = 1600.0
 private const val DEFAULT_TARGET_CAL = 2500
 
-class MainActivity : ComponentActivity(), SensorEventListener {
-
-    private lateinit var sensorManager: SensorManager
-    private var stepSensor: Sensor? = null
+class MainActivity : ComponentActivity() {
 
     private lateinit var summaryDao: DailySummaryDao
     private lateinit var foodDao: FoodDao
     private lateinit var weightDao: WeightDao
     private lateinit var profileDao: ProfileDao
 
-    private var todaySteps by mutableIntStateOf(0)
     private var sensorAvailable by mutableStateOf(true)
 
     private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) startStepSensor() }
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { startStepService() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -138,9 +135,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         weightDao = db.weightDao()
         profileDao = db.profileDao()
 
-        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
-        sensorAvailable = stepSensor != null
+        sensorAvailable =
+            packageManager.hasSystemFeature(PackageManager.FEATURE_SENSOR_STEP_COUNTER)
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(background = ForlaBg, surface = ForlaBg)) {
@@ -150,7 +146,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     val zone = ZoneId.systemDefault()
                     val today = LocalDate.now()
                     val startOfDay = today.atStartOfDay(zone).toInstant().toEpochMilli()
-                    val endOfDay = today.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli() - 1
+                    val endOfDay =
+                        today.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli() - 1
 
                     val todayFoods by remember { foodDao.getBetween(startOfDay, endOfDay) }
                         .collectAsState(initial = emptyList())
@@ -158,13 +155,31 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     val profile by remember { profileDao.get() }.collectAsState(initial = null)
                     val weights by remember { weightDao.getAll() }.collectAsState(initial = emptyList())
 
+                    val todaySummary by remember { summaryDao.getByDateFlow(today.toString()) }
+                        .collectAsState(initial = null)
+                    val todaySteps = todaySummary?.totalSteps ?: 0
+
                     Column(modifier = Modifier.fillMaxSize()) {
                         Box(modifier = Modifier.weight(1f)) {
                             when (tab) {
-                                0 -> DashboardScreen(todayFoods, profile, todaySteps, sensorAvailable)
-                                1 -> AddFoodScreen(todayFoods, onAdd = { addFood(it) }, onDelete = { deleteFood(it) })
+                                0 -> DashboardScreen(
+                                    todayFoods,
+                                    profile,
+                                    todaySteps,
+                                    sensorAvailable
+                                )
+
+                                1 -> AddFoodScreen(
+                                    todayFoods,
+                                    onAdd = { addFood(it) },
+                                    onDelete = { deleteFood(it) })
+
                                 2 -> ActivityScreen(todaySteps, sensorAvailable, profile)
-                                3 -> ProgressScreen(weights, allFoods, onAddWeight = { addWeight(it) })
+                                3 -> ProgressScreen(
+                                    weights,
+                                    allFoods,
+                                    onAddWeight = { addWeight(it) })
+
                                 else -> ProfileScreen(profile, onSave = { saveProfile(it) })
                             }
                         }
@@ -178,53 +193,42 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     // ================= AKSI DB =================
-    private fun addFood(entry: FoodEntry) { lifecycleScope.launch { foodDao.insert(entry) } }
-    private fun deleteFood(entry: FoodEntry) { lifecycleScope.launch { foodDao.delete(entry) } }
-    private fun addWeight(entry: WeightEntry) { lifecycleScope.launch { weightDao.insert(entry) } }
-    private fun saveProfile(p: UserProfile) { lifecycleScope.launch { profileDao.upsert(p) } }
+    private fun addFood(entry: FoodEntry) {
+        lifecycleScope.launch { foodDao.insert(entry) }
+    }
 
-    // ================= SENSOR LANGKAH =================
+    private fun deleteFood(entry: FoodEntry) {
+        lifecycleScope.launch { foodDao.delete(entry) }
+    }
+
+    private fun addWeight(entry: WeightEntry) {
+        lifecycleScope.launch { weightDao.insert(entry) }
+    }
+
+    private fun saveProfile(p: UserProfile) {
+        lifecycleScope.launch { profileDao.upsert(p) }
+    }
+
+    // ================= START STEP SERVICE =================
     private fun ensurePermissionAndStart() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val granted = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ACTIVITY_RECOGNITION
-            ) == PackageManager.PERMISSION_GRANTED
-            if (granted) startStepSensor()
-            else permissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)
-        } else startStepSensor()
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION)
+            != PackageManager.PERMISSION_GRANTED
+        ) needed.add(Manifest.permission.ACTIVITY_RECOGNITION)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) needed.add(Manifest.permission.POST_NOTIFICATIONS)
+
+        if (needed.isEmpty()) startStepService()
+        else permissionLauncher.launch(needed.toTypedArray())
     }
 
-    private fun startStepSensor() {
-        stepSensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
+    private fun startStepService() {
+        ContextCompat.startForegroundService(this, Intent(this, StepService::class.java))
     }
-
-    override fun onResume() {
-        super.onResume()
-        startStepSensor()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        sensorManager.unregisterListener(this)
-    }
-
-    override fun onSensorChanged(event: SensorEvent?) {
-        if (event?.sensor?.type == Sensor.TYPE_STEP_COUNTER) {
-            val totalSinceBoot = event.values[0].toInt()
-            val today = LocalDate.now().toString()
-            val prefs = getSharedPreferences("forla", MODE_PRIVATE)
-            val baselineKey = "baseline_$today"
-            if (!prefs.contains(baselineKey)) {
-                prefs.edit().putInt(baselineKey, totalSinceBoot).apply()
-            }
-            val baseline = prefs.getInt(baselineKey, totalSinceBoot)
-            val steps = (totalSinceBoot - baseline).coerceAtLeast(0)
-            todaySteps = steps
-            lifecycleScope.launch { summaryDao.upsert(DailySummary(date = today, totalSteps = steps)) }
-        }
-    }
-
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }
 
 // ================= HITUNGAN =================

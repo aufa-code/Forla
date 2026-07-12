@@ -18,6 +18,9 @@ interface DailySummaryDao {
 
     @Query("SELECT * FROM daily_summary ORDER BY date DESC")
     fun getAll(): Flow<List<DailySummary>>
+
+    @Query("SELECT * FROM daily_summary WHERE date = :date")
+    fun getByDateFlow(date: String): Flow<DailySummary?>
 }
 
 // ===== FORLA DAOs =====
