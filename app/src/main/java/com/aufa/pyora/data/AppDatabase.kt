@@ -7,26 +7,16 @@ import androidx.room.RoomDatabase
 
 @Database(
     entities = [
-        Place::class,
-        ActivityRecord::class,
-        MoneyTransaction::class,
-        Memory::class,
         DailySummary::class,
-        // ===== FORLA =====
         FoodEntry::class,
         WeightEntry::class,
         UserProfile::class
     ],
-    version = 2,               // ⬆️ dibump dari 1 → 2
+    version = 3,           // ⬆️ WAJIB bump 2 → 3 (skema berubah)
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
-    abstract fun placeDao(): PlaceDao
-    abstract fun activityDao(): ActivityDao
-    abstract fun transactionDao(): TransactionDao
-    abstract fun memoryDao(): MemoryDao
     abstract fun dailySummaryDao(): DailySummaryDao
-    // ===== FORLA =====
     abstract fun foodDao(): FoodDao
     abstract fun weightDao(): WeightDao
     abstract fun profileDao(): ProfileDao
@@ -38,9 +28,9 @@ abstract class AppDatabase : RoomDatabase() {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
-                    "forla.db"                 // 🔄 ganti nama DB → fresh start
+                    "forla.db"
                 )
-                    .fallbackToDestructiveMigration()  // aman buat fase development
+                    .fallbackToDestructiveMigration()
                     .build().also { INSTANCE = it }
             }
         }
